@@ -1,4 +1,6 @@
 using ArcadeLink.Payments.Api.Consumers;
+using ArcadeLink.Payments.Api.Health;
+using ArcadeLink.Payments.Api.Messaging;
 using ArcadeLink.Payments.Api.Options;
 using MassTransit;
 
@@ -13,26 +15,8 @@ builder.Services.AddStackExchangeRedisCache(options =>
     options.Configuration = builder.Configuration["Redis:ConnectionString"]);
 builder.Services.AddSingleton<IApprovalRateProvider, CachedApprovalRateProvider>();
 
-builder.Services.AddMassTransit(x =>
-{
-    // Prefixed for consistency with the other services and to avoid any future collision if another
-    // service ever adds a consumer class with the same name on the shared RabbitMQ vhost (see the
-    // ArcadeLink.Catalog/Notifications PaymentProcessedEventConsumer gotcha discovered in Etapa 5).
-    x.SetEndpointNameFormatter(new KebabCaseEndpointNameFormatter("payments", false));
-
-    x.AddConsumer<OrderPlacedEventConsumer>();
-
-    x.UsingRabbitMq((context, cfg) =>
-    {
-        cfg.Host(builder.Configuration["RabbitMq:Host"], "/", h =>
-        {
-            h.Username(builder.Configuration["RabbitMq:Username"]!);
-            h.Password(builder.Configuration["RabbitMq:Password"]!);
-        });
-
-        cfg.ConfigureEndpoints(context);
-    });
-});
+// Prefixo "payments" por consistência e para evitar colisão futura de nomes de consumer (ver AddArcadeLinkMessaging).
+builder.Services.AddArcadeLinkMessaging(builder.Configuration, "payments", x => x.AddConsumer<OrderPlacedEventConsumer>());
 
 var app = builder.Build();
 
@@ -48,7 +32,7 @@ app.UseHttpsRedirection();
 // authentication/authorization wiring at all. Any authenticated endpoint added here in the future
 // must go through the API Gateway (Kong) and read the X-User-Id/X-User-Role headers it injects,
 // following the KongHeader scheme used by Users and Catalog.
-app.MapGet("/health", () => Results.Ok(new { status = "healthy" }))
+app.MapGet("/health", () => Results.Ok(HealthInfo.Create(app.Configuration, "payments-api")))
     .WithName("Health")
     .WithOpenApi();
 
