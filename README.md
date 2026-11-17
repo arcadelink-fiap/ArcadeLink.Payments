@@ -13,7 +13,7 @@ endpoint HTTP que tem, `GET /health`, é só para health probes internos do k8s)
 
 | Método | Rota | Descrição |
 |---|---|---|
-| GET | `/health` | Health check simples (útil para probes no k8s). |
+| GET | `/health` | Health check dos probes do k8s; devolve `status`, `service` e `version` (`APP_VERSION`, SHA curto). |
 
 ## Como rodar localmente
 
@@ -30,18 +30,30 @@ dotnet watch run
 Sobe em `http://localhost:5100`. Swagger em `/swagger`. Requisição de `GET /health` pronta em
 `ArcadeLink.Payments.Api.http`.
 
+## Segredos para desenvolvimento local (`dotnet user-secrets`)
+
+Ao rodar com `dotnet run`, defina os valores sensíveis fora do repositório (gere senhas com `openssl rand -hex 24`):
+
+```bash
+cd src/ArcadeLink.Payments.Api
+dotnet user-secrets set "RabbitMq:Username" "<usuario>"
+dotnet user-secrets set "RabbitMq:Password" "<senha>"
+dotnet user-secrets set "Redis:ConnectionString" "localhost:6379"
+```
+
 ## Configuração (variáveis de ambiente)
 
-Os valores em `appsettings.json` são placeholders de desenvolvimento. Para sobrescrever (Docker,
-compose, k8s), use a sintaxe de variável de ambiente do ASP.NET Core (`__` no lugar de `:`):
+O `appsettings.json` contém apenas configuração **não sensível**; nenhuma senha, chave ou connection string fica no código-fonte. Valores sensíveis são injetados em runtime (compose: `.env`; k8s: Secrets criados por `ArcadeLink.Orchestration/scripts/create-secrets.sh`; dev local: `dotnet user-secrets`). Use a sintaxe de variável de ambiente do ASP.NET Core (`__` no lugar de `:`):
 
 | Variável de ambiente | Descrição | Exemplo |
 |---|---|---|
 | `RabbitMq__Host` | Host do broker. | `localhost` (dev) / `rabbitmq` (compose/k8s) |
-| `RabbitMq__Username` | Usuário do broker. | `guest` |
-| `RabbitMq__Password` | Senha do broker. | `guest` |
+| `RabbitMq__Username` | Usuário do broker (sensível). | `<usuario>` |
+| `RabbitMq__Password` | Senha do broker (sensível). | `<senha>` |
 | `Payments__ApprovalRate` | Probabilidade (0.0–1.0) de aprovar um pagamento na simulação. Pode ser forçado para `0`/`1` para testes determinísticos. | `0.8` (padrão: 80% `Approved` / 20% `Rejected`) |
-| `Redis__ConnectionString` | Connection string do Redis (cache de `Payments:ApprovalRate`). | `localhost:6379` (dev) / `redis:6379` (k8s) |
+| `Redis__ConnectionString` | Connection string do Redis (cache de `Payments:ApprovalRate`; sensível no EKS). | `localhost:6379` (dev) / definido via Secret (k8s) |
+| `Messaging__Transport` / `Messaging__AmazonSqsRegion` | `RabbitMq` (padrão) ou `AmazonSqs` (opcional) e a região. | `RabbitMq` / `us-east-2` |
+| `APP_VERSION` | Versão exibida em `/health` (build-arg). | SHA curto |
 
 ## Docker
 
@@ -65,22 +77,35 @@ Rode a partir de lá com os 4 repositórios clonados lado a lado (mesmo diretór
 [README do ArcadeLink.Users](../ArcadeLink.Users/README.md#orquestração-completa-docker-compose)
 para instruções completas.
 
-## Kubernetes
+## CI/CD e Kubernetes (EKS)
 
-Manifestos em `k8s/` (`deployment.yaml`, `service.yaml`, `configmap.yaml`, `secret.yaml`) —
-`Deployment` usa `image: localhost/arcadelink-payments:latest` com `imagePullPolicy: Never` (sem
-registry, precisa ser carregada localmente no cluster antes do `kubectl apply`), `Service` expõe
-`port: 80` → `targetPort: 8080`. `RabbitMq:Host`/`Username`/`Payments:ApprovalRate` em `ConfigMap`;
-`RabbitMq:Password` em `Secret`.
+Em produção este serviço roda no **EKS** (`arcadelink-eks`, namespace `arcadelink`); o guia completo (Terraform,
+segredos, ordem de execução, custos, troubleshooting) está no
+[README do ArcadeLink.Orchestration](../ArcadeLink.Orchestration/README.md).
 
-O manifesto (`configmap.yaml`) já inclui `Redis__ConnectionString: "redis:6379"`, apontando para o
-Service `redis` do `ArcadeLink.Orchestration` — nenhuma edição manual é necessária antes de aplicar.
+**Pipeline** (`.github/workflows/ci-cd.yml`, GitHub Actions; autenticação na AWS por OIDC, sem access keys):
 
-Os manifestos de infraestrutura compartilhada (Postgres, RabbitMQ) ficam no repo âncora,
-`ArcadeLink.Users/k8s/`; os de Redis ficam no `ArcadeLink.Orchestration` — veja o
-[README do ArcadeLink.Users](../ArcadeLink.Users/README.md#kubernetes) e o
-[README do ArcadeLink.Orchestration](../ArcadeLink.Orchestration/README.md) para o passo a passo
-completo (build das imagens, carregar no cluster local, ordem de `kubectl apply`).
+```
+pull request  ->  Build e testes (dotnet test)
+push na main  ->  Build e testes -> docker build (tag = SHA do commit) -> Trivy (CRITICAL) -> push no ECR `arcadelink/payments`
+                  -> kubectl apply (rolling update) -> rollout status (falhou? rollout undo)
+```
+
+- **Tag da imagem** = SHA completo do commit; o SHA curto entra como `APP_VERSION` (build-arg) e aparece em
+  `GET /health` -> `{"status":"healthy","service":"payments-api","version":"<sha curto>"}`.
+- **Sem downtime**: `strategy.rollingUpdate` com `maxUnavailable: 0` e `maxSurge: 1`, `startupProbe`/
+  `readinessProbe`/`livenessProbe` em `GET /health` (porta 8080). Se a nova versão não ficar pronta, os pods
+  antigos continuam atendendo, o pipeline falha e executa `kubectl rollout undo`.
+- O deploy só roda em push na `main`. Variables necessárias no repositório do GitHub: `AWS_REGION`,
+  `AWS_ROLE_ARN`, `EKS_CLUSTER_NAME`, `ECR_REGISTRY` (sem Secrets neste repo — os segredos ficam no Orchestration).
+- Manifestos em `k8s/` (`deployment.yaml` com `${IMAGE}` substituído por `envsubst`, `service.yaml`,
+  `configmap.yaml`, `serviceaccount.yaml`). O ConfigMap contém só configuração **não sensível**; credenciais e
+  connection strings vêm do Secret `payments-api-secret` (via `envFrom`), criado pelo `deploy-platform` do Orchestration
+  a partir dos GitHub Secrets. O ConfigMap opcional `messaging-config` escolhe o transporte (`Messaging__Transport`:
+  `RabbitMq` padrão ou `AmazonSqs`, ver Orchestration).
+- Não é exposto pelo Kong: só consome/publica eventos e responde `/health` aos probes internos.
+- Postgres, RabbitMQ, Redis, MongoDB, Kong e observabilidade vivem em `ArcadeLink.Orchestration/k8s/`
+  (desde a Fase 4, não mais aqui).
 
 ## Consumer
 
